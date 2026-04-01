@@ -90,6 +90,14 @@ def _init_state():
             st.session_state.risk_pct        = rs.max_risk_pct
             if saved.get("strategy_weights"):
                 st.session_state.strategy_weights = saved["strategy_weights"]
+            # Restore dedup guards so reloads don't retrigger same trade
+            st.session_state.last_signal_key = saved.get("last_signal_key", "")
+            saved_tt = saved.get("last_trade_time")
+            if saved_tt:
+                try:
+                    st.session_state.last_trade_time = datetime.fromisoformat(saved_tt)
+                except Exception:
+                    st.session_state.last_trade_time = None
         else:
             st.session_state.risk_state = RiskState(
                 equity=st.session_state.equity,
@@ -107,6 +115,7 @@ def _persist_state():
     rs = st.session_state.risk_state
     if rs is None:
         return
+    last_tt = st.session_state.last_trade_time
     save_bot_state({
         "bot_running":        st.session_state.bot_running,
         "dry_run":            st.session_state.dry_run,
@@ -121,6 +130,8 @@ def _persist_state():
         "paused":             rs.paused,
         "pause_reason":       rs.pause_reason,
         "strategy_weights":   st.session_state.strategy_weights,
+        "last_signal_key":    st.session_state.last_signal_key,
+        "last_trade_time":    last_tt.isoformat() if last_tt else None,
     })
 
 
@@ -828,14 +839,14 @@ def run_bot_cycle():
 
         st.session_state.last_signals = [d for _, d, _ in new_sigs]
 
-        # Trade execution: DB count gate + cooldown
+        # Trade execution: DB count gate + 15-minute cooldown
         open_count = get_open_trade_count()
         if rs and new_sigs and open_count < rs.max_concurrent:
             rm       = RiskManager(rs)
             can, _   = rm.can_trade()
             last_tt  = st.session_state.last_trade_time
             cooldown = (last_tt is None or
-                        (datetime.now(timezone.utc) - last_tt).total_seconds() >= 300)
+                        (datetime.now(timezone.utc) - last_tt).total_seconds() >= 900)  # 15 min
 
             if can and cooldown:
                 top_sig, top_d, top_key = new_sigs[0]
@@ -884,47 +895,148 @@ def run_bot_cycle():
         st.session_state.errors.append(f"{datetime.now().strftime('%H:%M')} {type(e).__name__}: {e}")
 
 
+def _gold_pips(price_diff: float) -> float:
+    """
+    Gold pip calculation.
+    XAU/USD is quoted in USD per troy ounce.
+    1 pip for Gold = $0.10 movement in price.
+    So if price moves from 2000.00 → 2001.00, that is 10 pips.
+    price_diff should be positive for wins, negative for losses.
+    """
+    return price_diff / 0.10
+
+
+def _gold_pnl_usd(pips: float, lot_size: float) -> float:
+    """
+    PnL in USD for Gold.
+    Standard lot = 100 oz. Mini lot (0.1) = 10 oz. Micro lot (0.01) = 1 oz.
+    Pip value per standard lot = $10 (since 1 pip = $0.10 × 100 oz).
+    Pip value per micro lot (0.01) = $0.10.
+    Formula: pnl = pips × lot_size × $10 (per standard lot pip value)
+    """
+    pip_value_per_lot = 10.0   # $10 per pip per 1.0 standard lot
+    return round(pips * lot_size * pip_value_per_lot, 2)
+
+
 def _monitor_open_trades(price: float, rs: RiskState):
+    """
+    Check all open trades against current live price.
+
+    Guards in place:
+    1. Minimum 300s age — prevents closing on the same cycle trade was opened
+    2. Minimum movement guard — price must move at least 10% of ATR before checking
+    3. TP1 partial close — books 50% profit and moves SL to breakeven
+    4. TP2 full close — closes remaining 50%
+    5. SL full close — closes 100% at a loss
+    """
+    now = datetime.now(timezone.utc)
     for t in get_open_trades():
         entry  = float(t.get("entry_price") or 0)
         sl_p   = float(t.get("sl") or 0)
         tp1_p  = float(t.get("tp1") or 0)
         tp2_p  = float(t.get("tp2") or 0)
-        direct = t.get("direction","")
+        direct = t.get("direction", "")
         tid    = t.get("id")
+        status = t.get("status", "open")
+
         if price <= 0 or entry <= 0 or not tid:
             continue
+
+        # ── CRITICAL: minimum age check ───────────────────────────
+        # Without this guard, price == entry causes 0-pip close
+        # on the same rerun the trade was opened.
+        opened_str = t.get("open_time", "")
+        if opened_str:
+            try:
+                opened_dt = datetime.fromisoformat(opened_str)
+                if opened_dt.tzinfo is None:
+                    opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+                age_seconds = (now - opened_dt).total_seconds()
+                if age_seconds < 300:   # 5 minutes = safe minimum age
+                    continue
+            except Exception:
+                continue
+        else:
+            continue
+
+        # ── Guard: skip if price has barely moved from entry ───────
+        # Prevents 0-pip or near-zero-pip spurious closes
+        min_move = float(t.get("atr") or 5) * 0.1   # 10% of ATR = minimum meaningful move
+        if abs(price - entry) < min_move:
+            continue
+
+        # ── SL/TP checks ──────────────────────────────────────────
         if direct == "BUY":
+            # BUY profit = price rose above entry (price - entry > 0)
+            # BUY loss   = price fell below SL   (price - entry < 0)
             if price <= sl_p:
-                _close_trade(t, price, "sl_hit",  (price-entry)/0.1, rs)
+                pips = _gold_pips(price - entry)    # negative = loss
+                _close_trade(t, price, "sl_hit", pips, rs)
+
             elif price >= tp2_p:
-                _close_trade(t, price, "tp2_hit", (price-entry)/0.1, rs)
-            elif price >= tp1_p*0.98 and sl_p < entry:
-                update_trade(tid, {"sl": round(entry+0.10,2), "status":"breakeven"})
+                pips = _gold_pips(price - entry)    # positive = full win
+                _close_trade(t, price, "tp2_hit", pips, rs)
+
+            elif price >= tp1_p and status not in ("tp1_hit", "breakeven"):
+                # TP1 hit: book 50% profit, move SL to breakeven
+                pips = _gold_pips(price - entry)
+                pnl  = _gold_pnl_usd(pips, float(t.get("lot_size") or 0.01) * 0.5)
+                update_trade(tid, {
+                    "sl":     round(entry + 0.50, 2),   # SL above entry = can't lose
+                    "status": "tp1_hit",
+                    "notes":  (t.get("notes","") or "") + f" | TP1@{price:.2f}(+{pips:.1f}pips)",
+                })
+                RiskManager(rs).on_close(pips * 0.5, pnl)
+                _persist_state()
+
         elif direct == "SELL":
+            # SELL profit = entry > price (price fell). Loss = price > entry.
+            # entry - price: positive when price fell (win), negative when price rose (loss)
             if price >= sl_p:
-                _close_trade(t, price, "sl_hit",  (entry-price)/0.1, rs)
+                pips = _gold_pips(entry - price)    # negative value = loss (price rose past SL)
+                _close_trade(t, price, "sl_hit", pips, rs)
+
             elif price <= tp2_p:
-                _close_trade(t, price, "tp2_hit", (entry-price)/0.1, rs)
-            elif price <= tp1_p*1.02 and sl_p > entry:
-                update_trade(tid, {"sl": round(entry-0.10,2), "status":"breakeven"})
+                pips = _gold_pips(entry - price)    # positive value = full win
+                _close_trade(t, price, "tp2_hit", pips, rs)
+
+            elif price <= tp1_p and status not in ("tp1_hit", "breakeven"):
+                pips = _gold_pips(entry - price)    # positive partial win
+                pnl  = _gold_pnl_usd(pips, float(t.get("lot_size") or 0.01) * 0.5)
+                update_trade(tid, {
+                    "sl":     round(entry - 0.50, 2),   # SL to breakeven below entry
+                    "status": "tp1_hit",
+                    "notes":  (t.get("notes","") or "") + f" | TP1@{price:.2f}(+{pips:.1f}pips)",
+                })
+                RiskManager(rs).on_close(pips * 0.5, pnl)
+                _persist_state()
 
 
 def _close_trade(t: dict, price: float, status: str, pips: float, rs: RiskState):
-    lot    = float(t.get("lot_size") or 0.01)
-    pnl    = round(pips * lot, 2)
-    entry  = float(t.get("entry_price") or price)
-    opened = t.get("open_time","")
-    dur    = 0.0
+    """Close a trade fully: update DB record and credit PnL to risk state."""
+    lot     = float(t.get("lot_size") or 0.01)
+    pnl     = _gold_pnl_usd(pips, lot)
+    entry   = float(t.get("entry_price") or price)
+    opened  = t.get("open_time", "")
+    dur     = 0.0
     if opened:
-        try: dur = (datetime.now(timezone.utc)-datetime.fromisoformat(opened)).total_seconds()/60
-        except: pass
-    rr = abs(price-entry)/max(abs(entry-float(t.get("sl") or entry)),1e-6)
-    update_trade(t["id"],{
-        "exit_price":   price,    "status":       status,
-        "pnl_pips":     round(pips,1), "pnl_usd": pnl,
-        "close_time":   datetime.now(timezone.utc).isoformat(),
-        "duration_min": round(dur,1),  "rr_actual": round(rr,2),
+        try:
+            dt = datetime.fromisoformat(opened)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            dur = (datetime.now(timezone.utc) - dt).total_seconds() / 60
+        except Exception:
+            pass
+    sl_val = float(t.get("sl") or entry)
+    rr     = abs(price - entry) / max(abs(entry - sl_val), 0.01)
+    update_trade(t["id"], {
+        "exit_price":    price,
+        "status":        status,
+        "pnl_pips":      round(pips, 1),
+        "pnl_usd":       pnl,
+        "close_time":    datetime.now(timezone.utc).isoformat(),
+        "duration_min":  round(dur, 1),
+        "rr_actual":     round(rr, 2),
     })
     RiskManager(rs).on_close(pips, pnl)
     rs.open_trades = get_open_trade_count()
